@@ -8,6 +8,9 @@
 (define-constant err-proposal-ended (err u106))
 (define-constant err-insufficient-funds (err u107))
 (define-constant err-proposal-not-approved (err u108))
+(define-constant err-resource-not-found (err u109))
+(define-constant err-resource-claimed (err u110))
+(define-constant err-cannot-claim-own-resource (err u111))
 
 (define-data-var membership-fee uint u1000)
 (define-data-var proposal-duration uint u144)
@@ -32,7 +35,18 @@
 
 (define-map votes {proposal-id: uint, voter: principal} bool)
 
+(define-map shared-resources uint {
+    provider: principal,
+    resource-type: (string-ascii 30),
+    description: (string-ascii 200),
+    quantity: uint,
+    claimed: bool,
+    claimer: (optional principal),
+    created-at: uint
+})
+
 (define-data-var proposal-count uint u0)
+(define-data-var resource-count uint u0)
 
 (define-private (get-voting-power (member principal))
     (let ((reputation (default-to u0 (map-get? member-reputation member))))
@@ -136,4 +150,48 @@
             (not (get executed proposal))
             (> (get votes-for proposal) (get votes-against proposal))
             (>= (var-get treasury-balance) (get amount proposal)))
+        false))
+
+(define-public (share-resource (resource-type (string-ascii 30)) (description (string-ascii 200)) (quantity uint))
+    (let ((resource-id (+ (var-get resource-count) u1)))
+        (asserts! (default-to false (map-get? members tx-sender)) err-not-member)
+        (asserts! (> quantity u0) err-invalid-amount)
+        (map-set shared-resources resource-id {
+            provider: tx-sender,
+            resource-type: resource-type,
+            description: description,
+            quantity: quantity,
+            claimed: false,
+            claimer: none,
+            created-at: stacks-block-height
+        })
+        (var-set resource-count resource-id)
+        (award-reputation tx-sender u15)
+        (ok resource-id)))
+
+(define-public (claim-resource (resource-id uint))
+    (let ((resource (unwrap! (map-get? shared-resources resource-id) err-resource-not-found)))
+        (asserts! (default-to false (map-get? members tx-sender)) err-not-member)
+        (asserts! (not (get claimed resource)) err-resource-claimed)
+        (asserts! (not (is-eq tx-sender (get provider resource))) err-cannot-claim-own-resource)
+        (map-set shared-resources resource-id (merge resource {
+            claimed: true,
+            claimer: (some tx-sender)
+        }))
+        (award-reputation tx-sender u5)
+        (award-reputation (get provider resource) u10)
+        (ok true)))
+
+(define-read-only (get-resource (resource-id uint))
+    (map-get? shared-resources resource-id))
+
+(define-read-only (get-available-resources)
+    (ok {
+        total-resources: (var-get resource-count),
+        active-resources: u0
+    }))
+
+(define-read-only (is-resource-available (resource-id uint))
+    (match (map-get? shared-resources resource-id)
+        resource (not (get claimed resource))
         false))
