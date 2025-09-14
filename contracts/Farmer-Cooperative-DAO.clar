@@ -11,15 +11,35 @@
 (define-constant err-resource-not-found (err u109))
 (define-constant err-resource-claimed (err u110))
 (define-constant err-cannot-claim-own-resource (err u111))
+(define-constant err-not-guardian (err u112))
+(define-constant err-multisig-not-found (err u113))
+(define-constant err-already-signed (err u114))
+(define-constant err-insufficient-signatures (err u115))
+(define-constant err-multisig-expired (err u116))
 
 (define-data-var membership-fee uint u1000)
 (define-data-var proposal-duration uint u144)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
+(define-data-var multisig-threshold uint u5000)
+(define-data-var multisig-count uint u0)
+(define-data-var multisig-duration uint u1008)
 
 (define-map members principal bool)
 (define-map member-contributions principal uint)
 (define-map member-reputation principal uint)
+(define-map treasury-guardians principal bool)
+(define-map multisig-transactions uint {
+    initiator: principal,
+    recipient: principal,
+    amount: uint,
+    purpose: (string-ascii 100),
+    signatures: (list 10 principal),
+    signatures-count: uint,
+    executed: bool,
+    expires-at: uint
+})
+(define-map multisig-signatures {tx-id: uint, signer: principal} bool)
 
 (define-map proposals uint {
     creator: principal,
@@ -194,4 +214,81 @@
 (define-read-only (is-resource-available (resource-id uint))
     (match (map-get? shared-resources resource-id)
         resource (not (get claimed resource))
+        false))
+
+(define-public (appoint-treasury-guardian (guardian principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (default-to false (map-get? members guardian)) err-not-member)
+        (map-set treasury-guardians guardian true)
+        (ok true)))
+
+(define-public (revoke-treasury-guardian (guardian principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-delete treasury-guardians guardian)
+        (ok true)))
+
+(define-public (create-multisig-transaction (recipient principal) (amount uint) (purpose (string-ascii 100)))
+    (let ((tx-id (+ (var-get multisig-count) u1)))
+        (asserts! (default-to false (map-get? treasury-guardians tx-sender)) err-not-guardian)
+        (asserts! (>= amount (var-get multisig-threshold)) err-invalid-amount)
+        (asserts! (>= (var-get treasury-balance) amount) err-insufficient-funds)
+        (map-set multisig-transactions tx-id {
+            initiator: tx-sender,
+            recipient: recipient,
+            amount: amount,
+            purpose: purpose,
+            signatures: (list tx-sender),
+            signatures-count: u1,
+            executed: false,
+            expires-at: (+ stacks-block-height (var-get multisig-duration))
+        })
+        (map-set multisig-signatures {tx-id: tx-id, signer: tx-sender} true)
+        (var-set multisig-count tx-id)
+        (ok tx-id)))
+
+(define-public (sign-multisig-transaction (tx-id uint))
+    (let ((transaction (unwrap! (map-get? multisig-transactions tx-id) err-multisig-not-found)))
+        (asserts! (default-to false (map-get? treasury-guardians tx-sender)) err-not-guardian)
+        (asserts! (not (get executed transaction)) err-multisig-expired)
+        (asserts! (<= stacks-block-height (get expires-at transaction)) err-multisig-expired)
+        (asserts! (not (default-to false (map-get? multisig-signatures {tx-id: tx-id, signer: tx-sender}))) err-already-signed)
+        (let ((updated-signatures (unwrap! (as-max-len? (append (get signatures transaction) tx-sender) u10) err-invalid-amount))
+              (new-count (+ (get signatures-count transaction) u1)))
+            (map-set multisig-transactions tx-id (merge transaction {
+                signatures: updated-signatures,
+                signatures-count: new-count
+            }))
+            (map-set multisig-signatures {tx-id: tx-id, signer: tx-sender} true)
+            (ok true))))
+
+(define-public (execute-multisig-transaction (tx-id uint))
+    (let ((transaction (unwrap! (map-get? multisig-transactions tx-id) err-multisig-not-found)))
+        (asserts! (not (get executed transaction)) err-multisig-expired)
+        (asserts! (<= stacks-block-height (get expires-at transaction)) err-multisig-expired)
+        (asserts! (>= (get signatures-count transaction) u3) err-insufficient-signatures)
+        (asserts! (>= (var-get treasury-balance) (get amount transaction)) err-insufficient-funds)
+        (let ((transfer-result (as-contract (stx-transfer? (get amount transaction) tx-sender (get recipient transaction)))))
+            (asserts! (is-ok transfer-result) err-insufficient-funds)
+            (var-set treasury-balance (- (var-get treasury-balance) (get amount transaction)))
+            (map-set multisig-transactions tx-id (merge transaction {executed: true}))
+            (ok true))))
+
+(define-read-only (get-multisig-transaction (tx-id uint))
+    (map-get? multisig-transactions tx-id))
+
+(define-read-only (is-treasury-guardian (address principal))
+    (default-to false (map-get? treasury-guardians address)))
+
+(define-read-only (get-multisig-threshold)
+    (var-get multisig-threshold))
+
+(define-read-only (can-execute-multisig (tx-id uint))
+    (match (map-get? multisig-transactions tx-id)
+        transaction (and
+            (not (get executed transaction))
+            (<= stacks-block-height (get expires-at transaction))
+            (>= (get signatures-count transaction) u3)
+            (>= (var-get treasury-balance) (get amount transaction)))
         false))
