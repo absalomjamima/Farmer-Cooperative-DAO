@@ -16,6 +16,9 @@
 (define-constant err-already-signed (err u114))
 (define-constant err-insufficient-signatures (err u115))
 (define-constant err-multisig-expired (err u116))
+(define-constant err-stake-not-found (err u117))
+(define-constant err-stake-locked (err u118))
+(define-constant err-no-rewards (err u119))
 
 (define-data-var membership-fee uint u1000)
 (define-data-var proposal-duration uint u144)
@@ -24,6 +27,9 @@
 (define-data-var multisig-threshold uint u5000)
 (define-data-var multisig-count uint u0)
 (define-data-var multisig-duration uint u1008)
+(define-data-var stake-count uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var reward-pool uint u0)
 
 (define-map members principal bool)
 (define-map member-contributions principal uint)
@@ -40,6 +46,14 @@
     expires-at: uint
 })
 (define-map multisig-signatures {tx-id: uint, signer: principal} bool)
+(define-map stakes uint {
+    staker: principal,
+    amount: uint,
+    locked-until: uint,
+    created-at: uint,
+    active: bool
+})
+(define-map staker-stakes principal (list 20 uint))
 
 (define-map proposals uint {
     creator: principal,
@@ -291,4 +305,80 @@
             (<= stacks-block-height (get expires-at transaction))
             (>= (get signatures-count transaction) u3)
             (>= (var-get treasury-balance) (get amount transaction)))
+        false))
+
+(define-public (stake-tokens (amount uint) (lock-duration uint))
+    (let ((stake-id (+ (var-get stake-count) u1))
+          (locked-until (+ stacks-block-height lock-duration)))
+        (asserts! (default-to false (map-get? members tx-sender)) err-not-member)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (>= lock-duration u144) err-invalid-amount)
+        (let ((payment (stx-transfer? amount tx-sender (as-contract tx-sender))))
+            (asserts! (is-ok payment) err-invalid-amount)
+            (map-set stakes stake-id {
+                staker: tx-sender,
+                amount: amount,
+                locked-until: locked-until,
+                created-at: stacks-block-height,
+                active: true
+            })
+            (let ((current-stakes (default-to (list) (map-get? staker-stakes tx-sender))))
+                (map-set staker-stakes tx-sender (unwrap! (as-max-len? (append current-stakes stake-id) u20) err-invalid-amount)))
+            (var-set stake-count stake-id)
+            (var-set total-staked (+ (var-get total-staked) amount))
+            (let ((reputation-reward (/ (* amount lock-duration) u1000)))
+                (award-reputation tx-sender reputation-reward))
+            (ok stake-id))))
+
+(define-public (unstake-tokens (stake-id uint))
+    (let ((stake (unwrap! (map-get? stakes stake-id) err-stake-not-found)))
+        (asserts! (is-eq tx-sender (get staker stake)) err-not-member)
+        (asserts! (get active stake) err-stake-not-found)
+        (asserts! (> stacks-block-height (get locked-until stake)) err-stake-locked)
+        (let ((amount (get amount stake))
+              (duration (- (get locked-until stake) (get created-at stake)))
+              (reward (calculate-stake-reward amount duration)))
+            (try! (as-contract (stx-transfer? amount tx-sender (get staker stake))))
+            (if (> reward u0)
+                (begin
+                    (asserts! (>= (var-get reward-pool) reward) err-insufficient-funds)
+                    (try! (as-contract (stx-transfer? reward tx-sender (get staker stake))))
+                    (var-set reward-pool (- (var-get reward-pool) reward)))
+                true)
+            (map-set stakes stake-id (merge stake {active: false}))
+            (var-set total-staked (- (var-get total-staked) amount))
+            (ok true))))
+
+(define-private (calculate-stake-reward (amount uint) (duration uint))
+    (let ((base-reward (/ (* amount duration) u100000)))
+        (if (> (var-get reward-pool) u0)
+            (if (> base-reward (var-get reward-pool))
+                (var-get reward-pool)
+                base-reward)
+            u0)))
+
+(define-public (fund-reward-pool (amount uint))
+    (let ((payment (stx-transfer? amount tx-sender (as-contract tx-sender))))
+        (asserts! (is-ok payment) err-invalid-amount)
+        (var-set reward-pool (+ (var-get reward-pool) amount))
+        (ok true)))
+
+(define-read-only (get-stake (stake-id uint))
+    (map-get? stakes stake-id))
+
+(define-read-only (get-staker-stakes (staker principal))
+    (default-to (list) (map-get? staker-stakes staker)))
+
+(define-read-only (get-staking-stats)
+    (ok {
+        total-staked: (var-get total-staked),
+        total-stakes: (var-get stake-count),
+        reward-pool: (var-get reward-pool)
+    }))
+
+(define-read-only (can-unstake (stake-id uint))
+    (match (map-get? stakes stake-id)
+        stake (and
+            (get active stake)
+            (> stacks-block-height (get locked-until stake)))
         false))
