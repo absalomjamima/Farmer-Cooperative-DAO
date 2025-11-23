@@ -19,6 +19,8 @@
 (define-constant err-stake-not-found (err u117))
 (define-constant err-stake-locked (err u118))
 (define-constant err-no-rewards (err u119))
+(define-constant err-cannot-delegate-to-self (err u120))
+(define-constant err-delegation-not-found (err u121))
 
 (define-data-var membership-fee uint u1000)
 (define-data-var proposal-duration uint u144)
@@ -54,6 +56,8 @@
     active: bool
 })
 (define-map staker-stakes principal (list 20 uint))
+(define-map delegations principal principal)
+(define-map delegated-power principal uint)
 
 (define-map proposals uint {
     creator: principal,
@@ -82,9 +86,14 @@
 (define-data-var proposal-count uint u0)
 (define-data-var resource-count uint u0)
 
-(define-private (get-voting-power (member principal))
+(define-private (get-base-voting-power (member principal))
     (let ((reputation (default-to u0 (map-get? member-reputation member))))
         (+ u1 (/ reputation u100))))
+
+(define-private (get-voting-power (member principal))
+    (let ((base-power (get-base-voting-power member))
+          (delegated (default-to u0 (map-get? delegated-power member))))
+        (+ base-power delegated)))
 
 (define-private (award-reputation (member principal) (points uint))
     (let ((current-rep (default-to u0 (map-get? member-reputation member))))
@@ -382,3 +391,43 @@
             (get active stake)
             (> stacks-block-height (get locked-until stake)))
         false))
+
+(define-public (delegate-voting-power (delegate principal))
+    (let ((current-delegate (map-get? delegations tx-sender))
+          (delegator-power (get-base-voting-power tx-sender)))
+        (asserts! (default-to false (map-get? members tx-sender)) err-not-member)
+        (asserts! (default-to false (map-get? members delegate)) err-not-member)
+        (asserts! (not (is-eq tx-sender delegate)) err-cannot-delegate-to-self)
+        (match current-delegate
+            old-delegate
+            (let ((old-delegate-power (default-to u0 (map-get? delegated-power old-delegate)))
+                  (new-old-power (if (>= (default-to u0 (map-get? delegated-power old-delegate)) delegator-power)
+                                     (- (default-to u0 (map-get? delegated-power old-delegate)) delegator-power)
+                                     u0)))
+                (map-set delegated-power old-delegate new-old-power))
+            true)
+        (let ((new-delegate-power (default-to u0 (map-get? delegated-power delegate))))
+            (map-set delegated-power delegate (+ new-delegate-power delegator-power)))
+        (map-set delegations tx-sender delegate)
+        (ok true)))
+
+(define-public (revoke-delegation)
+    (let ((current-delegate (unwrap! (map-get? delegations tx-sender) err-delegation-not-found))
+          (delegator-power (get-base-voting-power tx-sender))
+          (delegate-power (default-to u0 (map-get? delegated-power current-delegate))))
+        (asserts! (default-to false (map-get? members tx-sender)) err-not-member)
+        (let ((new-power (if (>= delegate-power delegator-power) (- delegate-power delegator-power) u0)))
+            (map-set delegated-power current-delegate new-power))
+        (map-delete delegations tx-sender)
+        (ok true)))
+
+(define-read-only (get-delegate (member principal))
+    (map-get? delegations member))
+
+(define-read-only (get-total-voting-power (member principal))
+    (if (default-to false (map-get? members member))
+        (get-voting-power member)
+        u0))
+
+(define-read-only (get-delegated-power (member principal))
+    (default-to u0 (map-get? delegated-power member)))
